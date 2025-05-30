@@ -1,10 +1,21 @@
 # embedding_api.py
+
 from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
 import numpy as np
 import oracledb
 import os
-from dotenv import load_dotenv
-load_dotenv()
+
+# ✅ Explicitly load .env from correct path
+dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
+load_dotenv(dotenv_path=dotenv_path)
+
+# ✅ Debug: Print loaded environment values to confirm
+print("✅ ORACLE_HOST:", os.getenv("ORACLE_HOST"))
+print("✅ ORACLE_PORT:", os.getenv("ORACLE_PORT"))
+print("✅ ORACLE_SERVICE:", os.getenv("ORACLE_SERVICE"))
+print("✅ ORACLE_USER:", os.getenv("ORACLE_USER"))
+print("✅ ORACLE_PASSWORD:", os.getenv("ORACLE_PASSWORD"))
 
 def embed_and_store(file_name, chunks):
     model = SentenceTransformer("all-MiniLM-L6-v2")

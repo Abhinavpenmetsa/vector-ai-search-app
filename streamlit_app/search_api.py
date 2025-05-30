@@ -1,15 +1,15 @@
 # search_api.py
 from fastapi import FastAPI, Query
 from sentence_transformers import SentenceTransformer, util
+from dotenv import load_dotenv
+load_dotenv()
 import numpy as np
 import oracledb
 import os
-from dotenv import load_dotenv
 import json
 from typing import List, Dict, Any
 import re
 
-load_dotenv()
 
 app = FastAPI(title="Vector Search API")
 
