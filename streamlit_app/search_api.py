@@ -1,7 +1,7 @@
-# search_api.py
 from fastapi import FastAPI, Query
 from sentence_transformers import SentenceTransformer, util
 from dotenv import load_dotenv
+from openai_utils import get_openai_embedding, summarize_text, answer_question
 load_dotenv()
 import numpy as np
 import oracledb
@@ -10,10 +10,10 @@ import json
 from typing import List, Dict, Any
 import re
 
-
 app = FastAPI(title="Vector Search API")
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
+sentence_model = SentenceTransformer("all-MiniLM-L6-v2")
+use_openai = os.getenv("USE_OPENAI_EMBEDDINGS", "false").lower() == "true"
 
 dsn = oracledb.makedsn(
     os.getenv("ORACLE_HOST"),
@@ -26,54 +26,40 @@ def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
         return 0.0
     return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
 
-def extract_best_sentence(chunk_text: str, query: str) -> str:
-    import re
-    from difflib import SequenceMatcher
+def get_embedding(text: str) -> np.ndarray:
+    if use_openai:
+        return get_openai_embedding(text)
+    return sentence_model.encode([text])[0]
 
+def extract_best_sentence(chunk_text: str, query: str) -> str:
     sentences = re.split(r'(?<=[.!?])\s+', chunk_text.strip())
     if not sentences:
         return chunk_text.strip()
 
-    sentence_embeddings = model.encode(sentences)
-    query_embedding = model.encode(query)
-    scores = util.pytorch_cos_sim(query_embedding, sentence_embeddings)[0]
+    if use_openai:
+        query_embedding = get_embedding(query)
+        sentence_embeddings = [get_embedding(s) for s in sentences]
+        scores = [cosine_similarity(query_embedding, s_emb) for s_emb in sentence_embeddings]
+    else:
+        sentence_embeddings = sentence_model.encode(sentences)
+        query_embedding = sentence_model.encode(query)
+        scores = util.pytorch_cos_sim(query_embedding, sentence_embeddings)[0]
 
-    keyword_matches = []
-    query_words = set(query.lower().split())
+    best_index = np.argmax(scores)
+    best_sentence = sentences[best_index].strip()
 
-    for i, sentence in enumerate(sentences):
-        sentence_clean = sentence.lower()
-        word_overlap = len(query_words.intersection(sentence_clean.split()))
-        contains_digit = any(char.isdigit() for char in sentence_clean)
-
-        # Strong candidate if it matches many query terms and includes numbers
-        if word_overlap >= 2 and contains_digit:
-            keyword_matches.append((i, scores[i].item()))
-
-    # If we found keyword-rich sentences, return the highest scoring among them
-    if keyword_matches:
-        best_i = max(keyword_matches, key=lambda x: x[1])[0]
-        return sentences[best_i].strip()
-
-    # Else fallback to highest cosine similarity
-    best_index = scores.argmax().item()
-    return sentences[best_index].strip()
-
-
-def keyword_filter(results: List[Dict[str, Any]], keyword: str) -> List[Dict[str, Any]]:
-    keyword = keyword.lower()
-    for item in results:
-        item["keyword_match"] = keyword in item["text"].lower()
-    return sorted(results, key=lambda x: (x["keyword_match"], x["score"]), reverse=True)
+    if len(best_sentence.split()) > 50:
+        return summarize_text(best_sentence)
+    return best_sentence
 
 @app.get("/search")
 def search_chunks(
     query: str = Query(..., description="Search query string"),
     top_k: int = Query(3, description="Number of top results to return"),
-    min_score: float = Query(0.25, description="Minimum similarity score to consider")
+    min_score: float = Query(0.25, description="Minimum similarity score to consider"),
+    summarize: bool = Query(False, description="Whether to summarize the results")
 ) -> Dict[str, Any]:
-
-    query_vector = model.encode([query])[0]
+    query_vector = get_embedding(query)
 
     connection = oracledb.connect(
         user=os.getenv("ORACLE_USER"),
@@ -104,22 +90,46 @@ def search_chunks(
                     "text": chunk_text
                 })
         except Exception as e:
-            print(f"\u26a0\ufe0f Skipping chunk due to error: {e}")
+            print(f"⚠️ Skipping chunk due to error: {e}")
             continue
 
-    filtered_results = keyword_filter(scored_chunks, query)
+    scored_chunks.sort(key=lambda x: x["score"], reverse=True)
 
-    for item in filtered_results[:top_k]:
-        item["best_sentence"] = extract_best_sentence(item["text"], query)
+    final_results = []
+    for item in scored_chunks[:top_k]:
+        best_sentence = extract_best_sentence(item["text"], query)
 
-    final_results = [
-        {
+        result = {
             "file": item["file"],
             "chunk_index": item["chunk_index"],
             "score": item["score"],
-            "best_sentence": item["best_sentence"]
+            "best_sentence": best_sentence,
+            "text": item["text"]  # ✅ include full text so `/ask` can use it
         }
-        for item in filtered_results[:top_k]
-    ]
+
+        if summarize:
+            result["summary"] = summarize_text(item["text"])
+
+        final_results.append(result)
 
     return {"query": query, "results": final_results}
+
+@app.get("/ask")
+def ask_question(
+    question: str = Query(..., description="Question to ask about the documents"),
+    top_k: int = Query(3, description="Number of relevant chunks to use for answering")
+) -> Dict[str, Any]:
+    search_results = search_chunks(question, top_k=top_k, min_score=0.2)
+
+    context = "\n\n".join([item["text"] for item in search_results["results"] if "text" in item])
+
+    answer = answer_question(context, question)
+
+    return {
+        "question": question,
+        "answer": answer,
+        "sources": [
+            {"file": item["file"], "chunk_index": item["chunk_index"]}
+            for item in search_results["results"]
+        ]
+    }
